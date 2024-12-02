@@ -21,6 +21,34 @@ class LlamaConfig:
 
     device:str = None
 
+
+class SelfAttention(nn.Module):
+    def __init__(self,config):
+        super().__init()
+        self.n_kv_heads = config.n_heads if config.n_kv_heads is None else config.n_kv_heads
+        self.n_head_q = config.n_heads
+        self.r_rep = self.n_head_q//self.n_kv_heads #split the ratio of queries and kv
+        self.head_dim = config.n_emb//config.n_heads
+        #weights and projection
+        self.wq = nn.Linear(config.n_emb,config.n_heads*self.head_dim,bias=False)
+        self.wk = nn.Linear(config.n_emb,self.n_kv_heads*self.head_dim,bias=False)
+        self.wv = nn.Linear(config.n_emb,self.n_kv_heads*self.head_dim,bias=False)
+        self.woo = nn.Linear(config.n_heads*self.head_dim,config.n_emb,bias=False)
+
+        #cache for k and v
+        self.k_cache = torch.zeros((config.max_batch_size,config.max_seq_len,self.n_kv_heads,self.head_dim))
+        self.v_cache = torch.zeros((config.max_batch_size,config.max_seq_len,self.n_kv_heads,self.head_dim))
+
+    def forward(self,x,start_pos,frequency_complex):
+        batch_size,seq_len,_ = x.shape
+
+        query = self.wq(x)
+        key = self.wk(x)
+        value = self.wv(x)
+
+        query = query.view(batch_size,seq_len,self.n_head_q,self.head_dim)
+
+
 def compute_theta_pos_freq(head_dim,seq_len,device,theta=1000.0):
     assert head_dim % 2 ==0
     theta_numerator = torch.arange(0,head_dim,2).float()
