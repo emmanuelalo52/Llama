@@ -47,6 +47,21 @@ class SelfAttention(nn.Module):
         value = self.wv(x)
 
         query = query.view(batch_size,seq_len,self.n_head_q,self.head_dim)
+        key = key.view(batch_size,seq_len,self.n_kv_heads,self.head_dim)
+
+        value = value.view(batch_size,seq_len,self.n_kv_heads,self.head_dim)
+
+        #apply RoPE
+        query = rotatry_postional_embedding(query,frequency_complex,device=x.device)
+        key = rotatry_postional_embedding(key,frequency_complex,device=x.device)
+
+        #append the position of kv cache
+        self.k_cache[:batch_size,start_pos:start_pos+seq_len] = key
+        self.v_cache[:batch_size,start_pos:start_pos+seq_len] = value
+
+        #retrieve the tokens into the kv cache
+        keys = self.k_cache[:batch_size,0:start_pos+seq_len]
+        value = self.k_cache[:batch_size,0:start_pos+seq_len]
 
 
 def compute_theta_pos_freq(head_dim,seq_len,device,theta=1000.0):
