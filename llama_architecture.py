@@ -130,7 +130,7 @@ class RMSNorm(nn.Module):
     def forward(self,x):
         return self.gamma * self._norm(x.float()).type_as(x)
     
-class FeedForward(nn.Module):
+class SwiGlu(nn.Module):
     def __init__(self,config):
         super().__init__()
         hidden_dim = 4 * config.n_emb
