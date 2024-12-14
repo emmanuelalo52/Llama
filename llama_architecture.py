@@ -7,19 +7,20 @@ from typing import Optional
 
 @dataclass
 class LlamaConfig:
-    n_emb: int = 4098
+    dim: int = 4096
     n_layers: int = 32
-    vocab_size: int = -1
     n_heads: int = 32
     n_kv_heads: Optional[int] = None
+    vocab_size: int = -1 # Later set in the build method
     multiple_of: int = 256
-    ffn_dim_multiplication: Optional[float] = None
+    ffn_dim_multiplier: Optional[float] = None
     norm_eps: float = 1e-5
-    #for kv cache
+
+    # Needed for KV cache
     max_batch_size: int = 32
     max_seq_len: int = 2048
 
-    device:str = None
+    device: str = None
 
 def repeat_kv(x, n_rep):
     batch_size,seq_len,n_kv_heads,head_dim = x.shape
@@ -29,76 +30,110 @@ def repeat_kv(x, n_rep):
         return (x[:,:,:,None,:].expand(batch_size,seq_len,n_kv_heads,n_rep,head_dim).reshape(batch_size,seq_len,n_kv_heads*n_rep,head_dim))
 
 class SelfAttention(nn.Module):
-    def __init__(self,config):
-        super().__init()
+    def __init__(self, config):
+        super().__init__()
+
+        # Indicates the number of heads for the Keys and Values
         self.n_kv_heads = config.n_heads if config.n_kv_heads is None else config.n_kv_heads
-        self.n_head_q = config.n_heads
-        self.r_rep = self.n_head_q//self.n_kv_heads #split the ratio of queries and kv
-        self.head_dim = config.n_emb//config.n_heads
-        #weights and projection
-        self.wq = nn.Linear(config.n_emb,config.n_heads*self.head_dim,bias=False)
-        self.wk = nn.Linear(config.n_emb,self.n_kv_heads*self.head_dim,bias=False)
-        self.wv = nn.Linear(config.n_emb,self.n_kv_heads*self.head_dim,bias=False)
-        self.wo = nn.Linear(config.n_heads*self.head_dim,config.n_emb,bias=False)
+        # Indicates the number of heads for the Queries
+        self.n_heads_q = config.n_heads
+        # Indicates how many times the Keys and Values should be repeated
+        self.n_rep = self.n_heads_q // self.n_kv_heads
+        # Indicates the dimension of each head, that is, the part of the embedding that each head will be responsible for
+        self.head_dim = config.dim // config.n_heads
 
-        #cache for k and v
-        self.k_cache = torch.zeros((config.max_batch_size,config.max_seq_len,self.n_kv_heads,self.head_dim))
-        self.v_cache = torch.zeros((config.max_batch_size,config.max_seq_len,self.n_kv_heads,self.head_dim))
+        self.wq = nn.Linear(config.dim, config.n_heads * self.head_dim, bias=False)
+        self.wk = nn.Linear(config.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.wv = nn.Linear(config.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.wo = nn.Linear(config.n_heads * self.head_dim, config.dim, bias=False)
 
-    def forward(self,x,start_pos,frequency_complex):
-        batch_size,seq_len,_ = x.shape
+        self.cache_k = torch.zeros((config.max_batch_size, config.max_seq_len, self.n_kv_heads, self.head_dim))
+        self.cache_v = torch.zeros((config.max_batch_size, config.max_seq_len, self.n_kv_heads, self.head_dim))
 
-        query_weight = self.wq(x)
-        key_weight = self.wk(x)
-        value_weight = self.wv(x)
+    def forward(
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        freqs_complex: torch.Tensor
+    ):
+        batch_size, seq_len, _ = x.shape  # (B, 1, Dim)
 
-        query_weight = query_weight.view(batch_size,seq_len,self.n_head_q,self.head_dim)
-        key_weight = key_weight.view(batch_size,seq_len,self.n_kv_heads,self.head_dim)
+        # (B, 1, Dim) -> (B, 1, H_Q * Head_Dim)
+        xq = self.wq(x)
+        # (B, 1, Dim) -> (B, 1, H_KV * Head_Dim)
+        xk = self.wk(x)
+        # (B, 1, Dim) -> (B, 1, H_KV * Head_Dim)
+        xv = self.wv(x)
 
-        value_weight = value_weight.view(batch_size,seq_len,self.n_kv_heads,self.head_dim)
+        # (B, 1, H_Q * Head_Dim) -> (B, 1, H_Q, Head_Dim)
+        xq = xq.view(batch_size, seq_len, self.n_heads_q, self.head_dim)
+        # (B, 1, H_KV * Head_Dim) -> (B, 1, H_KV, Head_Dim)
+        xk = xk.view(batch_size, seq_len, self.n_kv_heads, self.head_dim)
+        # (B, 1, H_KV * Head_Dim) -> (B, 1, H_KV, Head_Dim)
+        xv = xv.view(batch_size, seq_len, self.n_kv_heads, self.head_dim)
 
-        #apply RoPE
-        query_weight = rotatry_postional_embedding(query_weight,frequency_complex,device=x.device)
-        key_weight = rotatry_postional_embedding(key_weight,frequency_complex,device=x.device)
+        # (B, 1, H_Q, Head_Dim) --> (B, 1, H_Q, Head_Dim)
+        xq = apply_rotary_embeddings(xq, freqs_complex, device=x.device)
+        # (B, 1, H_KV, Head_Dim) --> (B, 1, H_KV, Head_Dim)
+        xk = apply_rotary_embeddings(xk, freqs_complex, device=x.device)
 
-        #append the position of kv cache
-        self.k_cache[:batch_size,start_pos:start_pos+seq_len] = key_weight
-        self.v_cache[:batch_size,start_pos:start_pos+seq_len] = value_weight
+        # Replace the entry in the cache
+        self.cache_k[:batch_size, start_pos : start_pos + seq_len] = xk
+        self.cache_v[:batch_size, start_pos : start_pos + seq_len] = xv
 
-        #retrieve the tokens into the kv cache
-        keys = self.k_cache[:batch_size,0:start_pos+seq_len]
-        value = self.k_cache[:batch_size,0:start_pos+seq_len]
-        
-        #broadcast through the entire head
-        keys = repeat_kv(keys,self.r_rep)
-        value = repeat_kv(value,self.r_rep)
+        # (B, Seq_Len_KV, H_KV, Head_Dim)
+        keys = self.cache_k[:batch_size, : start_pos + seq_len]
+        # (B, Seq_Len_KV, H_KV, Head_Dim)
+        values = self.cache_v[:batch_size, : start_pos + seq_len]
 
-        query_weight = query_weight.transpose(1,2)
-        keys = key_weight.transpose(1,2)
-        value = value_weight.transpose(1,2)
+        # Since every group of Q shares the same K and V heads, just repeat the K and V heads for every Q in the same group.
 
-        #attention weight
-        scores = torch.matmul(query_weight,keys.transpose(2,3))/math.sqrt(self.head_dim)
-        scores = F.softmax(scores.float(),dim=-1).type_as(query_weight)
+        # (B, Seq_Len_KV, H_KV, Head_Dim) --> (B, Seq_Len_KV, H_Q, Head_Dim)
+        keys = repeat_kv(keys, self.n_rep)
+        # (B, Seq_Len_KV, H_KV, Head_Dim) --> (B, Seq_Len_KV, H_Q, Head_Dim)
+        values = repeat_kv(values, self.n_rep)
 
-        output = torch.matmul(scores,value)
-        output = (output.transpose(1,2).contiguous().view(batch_size,seq_len,-1))
+        # (B, 1, H_Q, Head_Dim) -> (B, H_Q, 1, Head_Dim)
+        xq = xq.transpose(1, 2)
+        # (B, Seq_Len_KV, H_Q, Head_Dim) -> (B, H_Q, Seq_Len_KV, Head_Dim)
+        keys = keys.transpose(1, 2)
+        # (B, Seq_Len_KV, H_Q, Head_Dim) -> (B, H_Q, Seq_Len_KV, Head_Dim)
+        values = values.transpose(1, 2)
 
-        return self.wo(output)
+        # (B, H_Q, 1, Head_Dim) @ (B, H_Q, Head_Dim, Seq_Len_KV) -> (B, H_Q, 1, Seq_Len_KV)
+        scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+        # (B, H_Q, 1, Seq_Len_KV) -> (B, H_Q, 1, Seq_Len_KV)
+        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
 
-def compute_theta_pos_freq(head_dim,seq_len,device,theta=1000.0):
-    assert head_dim % 2 ==0
-    theta_numerator = torch.arange(0,head_dim,2).float()
-    theta = 1.0 / (theta ** (theta_numerator/head_dim)).to(device)
+        # (B, H_Q, 1, Seq_Len) @ (B, H_Q, Seq_Len_KV, Head_Dim) -> (B, H_Q, 1, Head_Dim)
+        output = torch.matmul(scores, values)
+        # (B, H_Q, 1, Head_Dim) -> (B, 1, H_Q, Head_Dim) -> (B, 1, Dim)
+        output = (output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1))
+        return self.wo(output) # (B, 1, Dim) -> (B, 1, Dim)
 
-    m = torch.arange(seq_len,device=device)
-    #multiply the positon m by the theta values
-    freqs = torch.outer(m,theta).float()
-    frequency_complex = torch.polar(torch.ones_like(freqs),freqs)
-    return frequency_complex
+def precompute_theta_pos_frequencies(head_dim, seq_len, device, theta  = 10000.0):
+    # As written in the paragraph 3.2.2 of the paper
+    # >> In order to generalize our results in 2D to any xi ∈ Rd where **d is even**, [...]
+    assert head_dim % 2 == 0, "Dimension must be divisible by 2"
+    # Build the theta parameter
+    # According to the formula theta_i = 10000^(-2(i-1)/dim) for i = [1, 2, ... dim/2]
+    # Shape: (Head_Dim / 2)
+    theta_numerator = torch.arange(0, head_dim, 2).float()
+    # Shape: (Head_Dim / 2)
+    theta = 1.0 / (theta ** (theta_numerator / head_dim)).to(device) # (Dim / 2)
+    # Construct the positions (the "m" parameter)
+    # Shape: (Seq_Len)
+    m = torch.arange(seq_len, device=device)
+    # Multiply each theta by each position using the outer product.
+    # Shape: (Seq_Len) outer_product* (Head_Dim / 2) -> (Seq_Len, Head_Dim / 2)
+    freqs = torch.outer(m, theta).float()
+    # We can compute complex numbers in the polar form c = R * exp(m * theta), where R = 1 as follows:
+    # (Seq_Len, Head_Dim / 2) -> (Seq_Len, Head_Dim / 2)
+    freqs_complex = torch.polar(torch.ones_like(freqs), freqs)
+    return freqs_complex
 
 
-def rotatry_postional_embedding(input,frequency_complex,device):
+def apply_rotary_embeddings(input,frequency_complex,device):
     # (B,T,nh,hs) -> (B,T,nh,hs/2)
     input_complex = torch.view_as_complex(input.float().reshape(*input.shape[-1],-1,2))
     # (T,hs/2) -> (1,T,1,hs/2)
@@ -109,41 +144,66 @@ def rotatry_postional_embedding(input,frequency_complex,device):
     return out.type_as(input).to(device)
 
 
-class Block(nn.Module):
-    def __init__(self,config):
+class EncoderBlock(nn.Module):
+
+    def __init__(self, config):
         super().__init__()
-        self.rmsnorm1 = RMSNorm(config.n_emb)
-        self.sa = SelfAttention(config)
-        self.swiglu = SwiGlu(config)
-        self.rmsnorm2 = RMSNorm(config.n_emb,eps=config.norm_eps)
-    def forward(self,x):
-        x = x + self.rmsnorm1(self.sa(x))
-        x = x + self.rmsnorm2(self.swiglu(x))
+
+        self.n_heads = config.n_heads
+        self.dim = config.dim
+        self.head_dim = config.dim // config.n_heads
+
+        self.attention = SelfAttention(config)
+        self.feed_forward = FeedForward(config)
+
+        # Normalization BEFORE the attention block
+        self.attention_norm = RMSNorm(config.dim, eps=config.norm_eps)
+        # Normalization BEFORE the feed forward block
+        self.ffn_norm = RMSNorm(config.dim, eps=config.norm_eps)
         
 class RMSNorm(nn.Module):
-    def __init__(self,dim,eps=1e-5):
+    def __init__(self, dim, eps = 1e-6):
         super().__init__()
         self.eps = eps
-        self.gamma = nn.Parameter(torch.ones_like(dim))
-    def _norm(self,x):
-        return x * torch.rsqrt(x.pow(2).mean(-1,keepdim=True)+self.eps)
-    def forward(self,x):
-        return self.gamma * self._norm(x.float()).type_as(x)
+        # The gamma parameter
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def _norm(self, x: torch.Tensor):
+        # (B, Seq_Len, Dim) * (B, Seq_Len, 1) = (B, Seq_Len, Dim)
+        # rsqrt: 1 / sqrt(x)
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x: torch.Tensor):
+        # (Dim) * (B, Seq_Len, Dim) = (B, Seq_Len, Dim)
+        return self.weight * self._norm(x.float()).type_as(x)
     
-class SwiGlu(nn.Module):
-    def __init__(self,config):
+
+class FeedForward(nn.Module):
+    def __init__(
+        self,
+        config
+    ):
         super().__init__()
-        hidden_dim = 4 * config.n_emb
+
+        hidden_dim = 4 * config.dim
         hidden_dim = int(2 * hidden_dim / 3)
-        if config.multiple_of is not None:
-            hidden_dim = config.multiple_of *((hidden_dim + config.multiple_of - 1) // config.multiple_of)
-        self.w1 = nn.Linear(config.n_emb, hidden_dim,bias=False)
-        self.w2 = nn.Linear(hidden_dim, config.n_emb, bias=False)
-        self.w3 = nn.Linear(config.n_emb, hidden_dim, bias=False)
-    def forward(self,x):
+        if config.ffn_dim_multiplier is not None:
+            hidden_dim = int(config.ffn_dim_multiplier * hidden_dim)
+        # Round the hidden_dim to the nearest multiple of the multiple_of parameter
+        hidden_dim = config.multiple_of * ((hidden_dim + config.multiple_of - 1) // config.multiple_of)
+
+        self.w1 = nn.Linear(config.dim, hidden_dim, bias=False)
+        self.w2 = nn.Linear(hidden_dim, config.dim, bias=False)
+        self.w3 = nn.Linear(config.dim, hidden_dim, bias=False)
+
+    def forward(self, x: torch.Tensor):
+        # (B, Seq_Len, Dim) --> (B, Seq_Len, Hidden_Dim)
         swish = F.silu(self.w1(x))
-        x_v = self.w3(x)
-        x = swish * x_v
+        # (B, Seq_Len, Dim) --> (B, Seq_Len, Hidden_Dim)
+        x_V = self.w3(x)
+        # (B, Seq_Len, Hidden_Dim) * (B, Seq_Len, Hidden_Dim) --> (B, Seq_Len, Hidden_Dim)
+        x = swish * x_V
+        # (B, Seq_Len, Hidden_Dim) --> (B, Seq_Len, Dim)
         x = self.w2(x)
         return x
 class LLamaTransformer(nn.Module):
@@ -152,20 +212,27 @@ class LLamaTransformer(nn.Module):
         self.config = config
         assert config.vocab_size != -1
         self.vocab_size = config.vocab_size
-        self.embeddings = nn.Embedding(self.vocab_size,config.n_emb)
+        self.tok_embeddings = nn.Embedding(self.vocab_size,config.dim)
         self.n_layers = config.n_layers
-        self.layers = nn.ModuleList([Block(config) for _ in range(config.n_layers)])
-        self.norm = RMSNorm(config.n_emb,eps=config.norm_eps)
-        self.output = nn.Linear(config.n_emb,self.vocab_size,bias=False)
-        self.frequency_complex = compute_theta_pos_freq(self.config.n_emb//self.config.n_heads,self.config.max_seq_len * 2,device=self.config.device)
+        self.layers = nn.ModuleList([EncoderBlock(config) for _ in range(config.n_layers)])
+        self.norm = RMSNorm(config.dim, eps=config.norm_eps)
+        self.output = nn.Linear(config.dim, self.vocab_size, bias=False)
+
+        self.freqs_complex = precompute_theta_pos_frequencies(self.config.dim // self.config.n_heads, self.config.max_seq_len * 2, device=self.config.device)
 
     def forward(self,x,start_pos):
-        batch_size,seq_len = x.shape # B,T
-        assert seq_len == 1
-        h = self.embeddings(x) # B,T -> B,T,C
-        freq_complex = self.frequency_complex[start_pos:start_pos + seq_len]
+        batch_size, seq_len = x.shape
+        assert seq_len == 1, "Only one token at a time can be processed"
+
+        # (B, Seq_Len) -> (B, Seq_Len, Dim)
+        h = self.tok_embeddings(x)
+
+        # Retrieve the pairs (m, theta) corresponding to the positions [start_pos, start_pos + seq_len]
+        freqs_complex = self.freqs_complex[start_pos:start_pos + seq_len]
+        
+        # Consecutively apply all the encoder layers
         for layer in self.layers:
-            h = layer(h,start_pos,freq_complex)
+            h = layer(h, start_pos, freqs_complex)
         h = self.norm(h)
         output = self.output(h).float()
         return output
