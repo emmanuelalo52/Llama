@@ -160,6 +160,12 @@ class EncoderBlock(nn.Module):
         self.attention_norm = RMSNorm(config.dim, eps=config.norm_eps)
         # Normalization BEFORE the feed forward block
         self.ffn_norm = RMSNorm(config.dim, eps=config.norm_eps)
+    def forward(self, x, start_pos, freqs_complex):
+        h = x + self.attention.forward(
+            self.attention_norm(x), start_pos, freqs_complex
+        )
+        out = h + self.feed_forward.forward(self.ffn_norm(h))
+        return out
         
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps = 1e-6):
