@@ -28,6 +28,9 @@ def repeat_kv(x, n_rep):
         return x
     else:
         return (x[:,:,:,None,:].expand(batch_size,seq_len,n_kv_heads,n_rep,head_dim).reshape(batch_size,seq_len,n_kv_heads*n_rep,head_dim))
+
+def lambda_init(depth):
+    return (0.8 - 0.6 * math.exp(-0.3*(depth))) #depth is layer index
 class SelfAttention(nn.Module):
     def __init__(self, config,depth):
         super().__init__()
@@ -41,19 +44,23 @@ class SelfAttention(nn.Module):
         # Indicates the dimension of each head, that is, the part of the embedding that each head will be responsible for
         self.head_dim = config.dim // config.n_heads
 
+        self.lambda_init = lambda_init(depth)
+        self.lambda_q1 = nn.parameter(torch.zeros(self.head_dim,dtype=torch.float32).normal_(mean=0,std=0.1))
+        self.lambda_k1 = nn.parameter(torch.zeros(self.head_dim,dtype=torch.float32).normal_(mean=0,std=0.1))
+        self.lambda_q2 = nn.parameter(torch.zeros(self.head_dim,dtype=torch.float32).normal_(mean=0,std=0.1))
+        self.lambda_k2 = nn.parameter(torch.zeros(self.head_dim,dtype=torch.float32).normal_(mean=0,std=0.1))
+
         self.wq = nn.Linear(config.dim, config.n_heads * self.head_dim, bias=False)
         self.wk = nn.Linear(config.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wv = nn.Linear(config.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wo = nn.Linear(config.n_heads * self.head_dim, config.dim, bias=False)
 
-        self.cache_k = torch.zeros((config.max_batch_size, config.max_seq_len, self.n_kv_heads, self.head_dim))
-        self.cache_v = torch.zeros((config.max_batch_size, config.max_seq_len, self.n_kv_heads, self.head_dim))
-
     def forward(
         self,
-        x: torch.Tensor,
-        start_pos: int,
-        freqs_complex: torch.Tensor
+        x,
+        start_pos,
+        freqs_complex,
+
     ):
         batch_size, seq_len, _ = x.shape  # (B, 1, Dim)
 
@@ -76,21 +83,12 @@ class SelfAttention(nn.Module):
         # (B, 1, H_KV, Head_Dim) --> (B, 1, H_KV, Head_Dim)
         xk = apply_rotary_embeddings(xk, freqs_complex, device=x.device)
 
-        # Replace the entry in the cache
-        self.cache_k[:batch_size, start_pos : start_pos + seq_len] = xk
-        self.cache_v[:batch_size, start_pos : start_pos + seq_len] = xv
-
-        # (B, Seq_Len_KV, H_KV, Head_Dim)
-        keys = self.cache_k[:batch_size, : start_pos + seq_len]
-        # (B, Seq_Len_KV, H_KV, Head_Dim)
-        values = self.cache_v[:batch_size, : start_pos + seq_len]
-
         # Since every group of Q shares the same K and V heads, just repeat the K and V heads for every Q in the same group.
 
         # (B, Seq_Len_KV, H_KV, Head_Dim) --> (B, Seq_Len_KV, H_Q, Head_Dim)
-        keys = repeat_kv(keys, self.n_rep)
+        keys = repeat_kv(xk, self.n_rep)
         # (B, Seq_Len_KV, H_KV, Head_Dim) --> (B, Seq_Len_KV, H_Q, Head_Dim)
-        values = repeat_kv(values, self.n_rep)
+        values = repeat_kv(xv, self.n_rep)
 
         # (B, 1, H_Q, Head_Dim) -> (B, H_Q, 1, Head_Dim)
         xq = xq.transpose(1, 2)
@@ -102,7 +100,13 @@ class SelfAttention(nn.Module):
         # (B, H_Q, 1, Head_Dim) @ (B, H_Q, Head_Dim, Seq_Len_KV) -> (B, H_Q, 1, Seq_Len_KV)
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
         # (B, H_Q, 1, Seq_Len_KV) -> (B, H_Q, 1, Seq_Len_KV)
+        #use diffrerential attention in the multi head attention
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+        lambda_1 = torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1,dim=-1).float()).type_as(xq)
+        lambda_2 = torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2,dim=-1).float()).type_as(xq)
+        sum_lambda = lambda_1 - lambda_2 + self.lambda_init
+        scores = scores.view(batch_size,self.n_heads_q,2,seq_len)
+        scores = scores[:,:,0] - sum_lambda * scores[:,:,1]
 
         # (B, H_Q, 1, Seq_Len) @ (B, H_Q, Seq_Len_KV, Head_Dim) -> (B, H_Q, 1, Head_Dim)
         output = torch.matmul(scores, values)
