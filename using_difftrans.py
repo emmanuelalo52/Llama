@@ -45,11 +45,10 @@ class SelfAttention(nn.Module):
         self.head_dim = config.dim // config.n_heads
 
         self.lambda_init = lambda_init(depth)
-        self.lambda_q1 = nn.parameter(torch.zeros(self.head_dim,dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.lambda_k1 = nn.parameter(torch.zeros(self.head_dim,dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.lambda_q2 = nn.parameter(torch.zeros(self.head_dim,dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.lambda_k2 = nn.parameter(torch.zeros(self.head_dim,dtype=torch.float32).normal_(mean=0,std=0.1))
-
+        self.lambda_q1 = nn.Parameter(torch.randn(self.head_dim, dtype=torch.float32) * 0.1)
+        self.lambda_k1 = nn.Parameter(torch.randn(self.head_dim, dtype=torch.float32) * 0.1)
+        self.lambda_q2 = nn.Parameter(torch.randn(self.head_dim, dtype=torch.float32) * 0.1)
+        self.lambda_k2 = nn.Parameter(torch.randn(self.head_dim, dtype=torch.float32) * 0.1)
         self.wq = nn.Linear(config.dim, config.n_heads * self.head_dim, bias=False)
         self.wk = nn.Linear(config.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wv = nn.Linear(config.dim, self.n_kv_heads * self.head_dim, bias=False)
@@ -102,11 +101,14 @@ class SelfAttention(nn.Module):
         # (B, H_Q, 1, Seq_Len_KV) -> (B, H_Q, 1, Seq_Len_KV)
         #use diffrerential attention in the multi head attention
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-        lambda_1 = torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1,dim=-1).float()).type_as(xq)
-        lambda_2 = torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2,dim=-1).float()).type_as(xq)
+        # Modify the attention scores using lambda parameters
+        lambda_1 = torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1, dim=-1)).type_as(xq)
+        lambda_2 = torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2, dim=-1)).type_as(xq)
         sum_lambda = lambda_1 - lambda_2 + self.lambda_init
-        scores = scores.view(batch_size,self.n_heads_q,2,seq_len)
-        scores = scores[:,:,0] - sum_lambda * scores[:,:,1]
+
+        # Apply differential attention (ensure reshaping is correct)
+        scores = scores.view(batch_size, self.n_heads_q, seq_len, seq_len)
+        scores = scores - sum_lambda.unsqueeze(-1) * scores
 
         # (B, H_Q, 1, Seq_Len) @ (B, H_Q, Seq_Len_KV, Head_Dim) -> (B, H_Q, 1, Head_Dim)
         output = torch.matmul(scores, values)
@@ -136,32 +138,27 @@ def precompute_theta_pos_frequencies(head_dim, seq_len, device, theta  = 10000.0
     return freqs_complex
 
 
-def apply_rotary_embeddings(input,frequency_complex,device):
-    # (B,T,nh,hs) -> (B,T,nh,hs/2)
-    input_complex = torch.view_as_complex(input.float().reshape(*input.shape[-1],-1,2))
-    # (T,hs/2) -> (1,T,1,hs/2)
+def apply_rotary_embeddings(input, frequency_complex, device):
+    # Reshape the input to separate the real and imaginary parts
+    input_reshaped = input.float().reshape(*input.shape[:-1], -1, 2)
+    input_complex = torch.view_as_complex(input_reshaped)
+    
+    # Apply rotary embeddings
     frequency_complex = frequency_complex.unsqueeze(0).unsqueeze(2)
     input_rotated = input_complex * frequency_complex
+    
+    # Convert back to real numbers
     out = torch.view_as_real(input_rotated)
     out = out.reshape(*input.shape)
     return out.type_as(input).to(device)
 
 
 class EncoderBlock(nn.Module):
-
-    def __init__(self, config):
+    def __init__(self, config, depth):
         super().__init__()
-
-        self.n_heads = config.n_heads
-        self.dim = config.dim
-        self.head_dim = config.dim // config.n_heads
-
-        self.attention = SelfAttention(config)
+        self.attention = SelfAttention(config, depth)
         self.feed_forward = FeedForward(config)
-
-        # Normalization BEFORE the attention block
         self.attention_norm = RMSNorm(config.dim, eps=config.norm_eps)
-        # Normalization BEFORE the feed forward block
         self.ffn_norm = RMSNorm(config.dim, eps=config.norm_eps)
     def forward(self, x, start_pos, freqs_complex):
         h = x + self.attention.forward(
@@ -183,8 +180,7 @@ class RMSNorm(nn.Module):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x: torch.Tensor):
-        # (Dim) * (B, Seq_Len, Dim) = (B, Seq_Len, Dim)
-        return self.weight * self._norm(x.float()).type_as(x)
+        return self.weight * self._norm(x).type_as(x)
     
 
 class FeedForward(nn.Module):
@@ -216,30 +212,22 @@ class FeedForward(nn.Module):
         x = self.w2(x)
         return x
 class LLamaTransformer(nn.Module):
-    def __init__(self,config):
+    def __init__(self, config):
         super().__init__()
         self.config = config
-        assert config.vocab_size != -1
-        self.vocab_size = config.vocab_size
-        self.tok_embeddings = nn.Embedding(self.vocab_size,config.dim)
-        self.n_layers = config.n_layers
-        self.layers = nn.ModuleList([EncoderBlock(config) for _ in range(config.n_layers)])
-        self.norm = RMSNorm(config.dim, eps=config.norm_eps)
-        self.output = nn.Linear(config.dim, self.vocab_size, bias=False)
+        self.device = config.device
+        self.tok_embeddings = nn.Embedding(self.vocab_size, config.dim).to(self.device)
+        self.layers = nn.ModuleList([EncoderBlock(config, depth=i).to(self.device) for i in range(config.n_layers)])
+        self.norm = RMSNorm(config.dim, eps=config.norm_eps).to(self.device)
+        self.output = nn.Linear(config.dim, self.vocab_size, bias=False).to(self.device)
+        self.freqs_complex = precompute_theta_pos_frequencies(
+            self.config.dim // self.config.n_heads, self.config.max_seq_len * 2, device=self.device
+        )
 
-        self.freqs_complex = precompute_theta_pos_frequencies(self.config.dim // self.config.n_heads, self.config.max_seq_len * 2, device=self.config.device)
-
-    def forward(self,x,start_pos):
+    def forward(self, x, start_pos):
         batch_size, seq_len = x.shape
-        assert seq_len == 1, "Only one token at a time can be processed"
-
-        # (B, Seq_Len) -> (B, Seq_Len, Dim)
         h = self.tok_embeddings(x)
-
-        # Retrieve the pairs (m, theta) corresponding to the positions [start_pos, start_pos + seq_len]
         freqs_complex = self.freqs_complex[start_pos:start_pos + seq_len]
-        
-        # Consecutively apply all the encoder layers
         for layer in self.layers:
             h = layer(h, start_pos, freqs_complex)
         h = self.norm(h)
